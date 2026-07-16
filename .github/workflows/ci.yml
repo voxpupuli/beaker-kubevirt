@@ -31,17 +31,11 @@ jobs:
         uses: voxpupuli/ruby-version@656370e339050da63b86b1c631f5f88a3f4c0803 # 1.0.1
   test:
     runs-on: ubuntu-latest
+    needs: rubocop_and_matrix
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - ruby: "3.2"
-            coverage: "yes"
-          - ruby: "3.3"
-          - ruby: "3.4"
-          - ruby: "4.0"
-    env:
-      COVERAGE: ${{ matrix.coverage }}
+        ruby: ${{ fromJSON(needs.rubocop_and_matrix.outputs.ruby) }}
     name: Ruby ${{ matrix.ruby }}
     steps:
       - uses: actions/checkout@v4
