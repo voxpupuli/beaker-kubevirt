@@ -12,3 +12,8 @@ gem 'pry', '~> 0.10'
 gem 'pry-byebug', '~> 3.4'
 gem 'rake', '~> 13.0'
 gem 'rspec', '~> 3.0'
+
+group :release, optional: true do
+  gem 'faraday-retry', '~> 2.1', require: false
+  gem 'github_changelog_generator', '~> 1.18', require: false
+end
