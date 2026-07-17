@@ -1,9 +1,5 @@
 # frozen_string_literal: true
 
-require 'simplecov'
-
-SimpleCov.start
-
 # Suppress Beaker::Kubevirt's at_exit cleanup handler during this gem's own
 # test run. In downstream projects (which may also have RSpec loaded) the
 # handler should remain active.
