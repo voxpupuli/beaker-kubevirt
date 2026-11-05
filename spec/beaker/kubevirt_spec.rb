@@ -96,6 +96,12 @@ RSpec.describe Beaker::Kubevirt do
       it 'uses the supplied identifier' do
         expect(identifier_for).to eq('beaker-ci-12345')
       end
+
+      it 'does not warn when the value is already a DNS label' do
+        identifier_for
+
+        expect(options[:logger]).not_to have_received(:warn)
+      end
     end
 
     context 'when BEAKER_KUBEVIRT_TEST_GROUP is longer than 63 characters' do
@@ -104,6 +110,29 @@ RSpec.describe Beaker::Kubevirt do
       it 'raises instead of truncating it' do
         expect { described_class.new(hosts, options) }
           .to raise_error(ArgumentError, /BEAKER_KUBEVIRT_TEST_GROUP must be at most 63 characters, got #{env_value.length}/)
+      end
+    end
+
+    context 'when BEAKER_KUBEVIRT_TEST_GROUP has uppercase letters and underscores' do
+      let(:env_value) { 'CI_1' }
+
+      it 'normalises it to the same identifier as its DNS-label form' do
+        expect(identifier_for).to eq('ci-1')
+      end
+
+      it 'uses that one value for the label and the resource names' do
+        host = { 'name' => 'test-host' }
+
+        expect(hypervisor.send(:get_labels, host)['beaker/test-group']).to eq('ci-1')
+        expect(hypervisor.send(:generate_vm_name, host)).to eq('ci-1-test-host')
+      end
+    end
+
+    context 'when BEAKER_KUBEVIRT_TEST_GROUP starts with a digit' do
+      let(:env_value) { '12345' }
+
+      it 'prefixes a letter so it is a valid DNS label' do
+        expect(identifier_for).to eq('x12345')
       end
     end
 
@@ -121,7 +150,7 @@ RSpec.describe Beaker::Kubevirt do
 
       it 'strips it and warns that the identifier was changed' do
         expect(identifier_for(options.merge(logger: logger))).to eq('beaker-ci-123')
-        expect(logger).to have_received(:warn).with(/not usable as a Kubernetes label value/)
+        expect(logger).to have_received(:warn).with(/not a valid DNS label/)
       end
     end
 
@@ -136,7 +165,7 @@ RSpec.describe Beaker::Kubevirt do
       it 'warns that the identifier was changed' do
         identifier_for(options.merge(logger: logger))
 
-        expect(logger).to have_received(:warn).with(/not usable as a Kubernetes label value/)
+        expect(logger).to have_received(:warn).with(/not a valid DNS label/)
       end
     end
 
@@ -166,6 +195,7 @@ RSpec.describe Beaker::Kubevirt do
     context 'when provisioning' do
       before do
         allow(hypervisor).to receive_messages(create_vm: true, wait_for_vm_ready: true, setup_networking: true, setup_port_forward: true)
+        allow(kubevirt_helper).to receive(:test_group_resources)
         hypervisor.provision
       end
 
@@ -179,6 +209,78 @@ RSpec.describe Beaker::Kubevirt do
 
       it 'sets up networking' do
         expect(hypervisor).to have_received(:setup_networking).with(hosts[0])
+      end
+
+      it 'does not look for existing resources under a generated identifier' do
+        expect(kubevirt_helper).not_to have_received(:test_group_resources)
+      end
+    end
+
+    context 'when BEAKER_KUBEVIRT_TEST_GROUP is set and unused' do
+      let(:env_value) { 'ci-1' }
+
+      before do
+        allow(kubevirt_helper).to receive(:test_group_resources).with('ci-1').and_return({})
+        allow(hypervisor).to receive_messages(setup_networking: true)
+        hypervisor.provision
+      end
+
+      it 'creates the vm' do
+        expect(hypervisor).to have_received(:create_vm).with(hosts[0])
+      end
+    end
+
+    context 'when BEAKER_KUBEVIRT_TEST_GROUP already labels resources' do
+      let(:env_value) { 'ci-1' }
+
+      before do
+        allow(kubevirt_helper).to receive(:test_group_resources).with('ci-1').and_return(
+          'VirtualMachine' => ['ci-1-test-host'],
+          'Secret' => ['ci-1-test-host-cloud-init'],
+        )
+        %i[cleanup_vms cleanup_data_volumes cleanup_secrets cleanup_services cleanup_temp_files].each do |m|
+          allow(kubevirt_helper).to receive(m)
+        end
+        allow(hypervisor).to receive(:cleanup).and_call_original
+      end
+
+      def provision_error
+        hypervisor.provision
+        nil
+      rescue RuntimeError => e
+        e
+      end
+
+      it 'raises naming the identifier, what was found, the causes and the fix' do
+        message = provision_error&.message
+
+        expect(message).to include('"ci-1"', 'beaker/test-group=ci-1')
+        expect(message).to include('VirtualMachine ci-1-test-host', 'Secret ci-1-test-host-cloud-init')
+        expect(message).to include('BEAKER_destroy=no', 'parallel job or matrix leg', 'second Beaker::Kubevirt instance')
+        expect(message).to include('kubectl -n beaker-test delete vm,dv,secret,svc -l beaker/test-group=ci-1')
+      end
+
+      it 'creates nothing' do
+        provision_error
+
+        expect(hypervisor).not_to have_received(:create_vm)
+      end
+
+      it 'does not call cleanup' do
+        provision_error
+
+        expect(hypervisor).not_to have_received(:cleanup)
+      end
+
+      it 'deletes nothing when cleanup or the at_exit handler runs afterwards' do
+        provision_error
+        hypervisor.cleanup
+        hypervisor.send(:cleanup_on_exit)
+
+        expect(kubevirt_helper).not_to have_received(:cleanup_vms)
+        expect(kubevirt_helper).not_to have_received(:cleanup_data_volumes)
+        expect(kubevirt_helper).not_to have_received(:cleanup_secrets)
+        expect(kubevirt_helper).not_to have_received(:cleanup_services)
       end
     end
   end
@@ -1375,6 +1477,32 @@ RSpec.describe Beaker::Kubevirt do
 
     it 'handles names that do not start with a letter' do
       expect(hypervisor.send(:sanitize_k8s_name, '1invalid-name')).to eq('x1invalid-name')
+    end
+
+    def dns_label
+      /\A[a-z]([-a-z0-9]{0,61}[a-z0-9])?\z/
+    end
+
+    it 'leaves a 63-character name unchanged' do
+      name = "a#{'b' * 61}c"
+      expect(hypervisor.send(:sanitize_k8s_name, name)).to eq(name)
+    end
+
+    it 'returns a valid DNS label for 64 or more underscores' do
+      expect(hypervisor.send(:sanitize_k8s_name, '_' * 64)).to match(dns_label)
+    end
+
+    it 'does not end in a hyphen when the cut lands on one' do
+      # '-' at index 53 (where the digest prefix is cut) and 62 (the old 63-character cut)
+      name = "#{'a' * 53}-#{'a' * 8}-#{'b' * 10}"
+      expect(hypervisor.send(:sanitize_k8s_name, name)).to match(dns_label)
+    end
+
+    it 'keeps long names that differ only in the tail distinct' do
+      names = %w[host1 host2].map { |tail| hypervisor.send(:sanitize_k8s_name, "#{'a' * 70}-#{tail}") }
+
+      expect(names.uniq.size).to eq(2)
+      expect(names).to all(match(dns_label))
     end
   end
 

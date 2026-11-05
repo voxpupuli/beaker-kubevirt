@@ -177,7 +177,9 @@ module Beaker
       @hosts = kubevirt_hosts
       # Ensure the helper gets the validated namespace
       @kubevirt_helper = KubevirtHelper.new(@options)
-      @test_group_identifier = configured_test_group_identifier || "beaker-#{SecureRandom.hex(4)}"
+      configured = configured_test_group_identifier
+      @test_group_identifier_configured = !configured.nil?
+      @test_group_identifier = configured || "beaker-#{SecureRandom.hex(4)}"
       @cleanup_called = false
       @cleanup_mutex = Mutex.new
       # "<pod_name>/<container>" => monotonic timestamp the container was first
@@ -192,7 +194,8 @@ module Beaker
       # This handles cases like Ctrl+C, errors, or test failures that occur after
       # provisioning but before normal cleanup
       # Note: Each instance registers its own at_exit handler, but cleanup is idempotent
-      # and scoped to the specific test_group_identifier for this instance
+      # and scoped to this instance's test_group_identifier, which is shared by
+      # every instance in the process when BEAKER_KUBEVIRT_TEST_GROUP is set
       # Skip registration during this gem's own rspec run (set by spec_helper).
       # Gating on `defined?(RSpec)` misfired in downstream projects that run
       # Beaker from inside their own rspec suite, suppressing the safety net
@@ -209,6 +212,7 @@ module Beaker
     def provision
       # rubocop:disable Style/CombinableLoops
       @logger.info("Starting KubeVirt provisioning with identifier: #{@test_group_identifier}")
+      ensure_test_group_unused!
 
       @hosts.each do |host|
         create_vm(host)
@@ -336,6 +340,34 @@ module Beaker
     end
 
     ##
+    # Refuse to provision under a BEAKER_KUBEVIRT_TEST_GROUP that already
+    # labels resources in the namespace.
+    #
+    # Those resources belong to another run, or to an earlier run that was
+    # kept. Creating under the same names fails with AlreadyExists, and the
+    # cleanup that follows a failed provision, or runs at exit, deletes by
+    # this label, so it would destroy them. Marking cleanup as already done
+    # before raising keeps cleanup, cleanup_on_exit and Beaker's own cleanup
+    # from touching them. A random identifier is not checked.
+    # @raise [RuntimeError] if any VM, DataVolume, Secret or Service carries the label
+    def ensure_test_group_unused!
+      return unless @test_group_identifier_configured
+
+      found = @kubevirt_helper.test_group_resources(@test_group_identifier)
+      return if found.empty?
+
+      @cleanup_mutex.synchronize { @cleanup_called = true }
+      label = "beaker/test-group=#{@test_group_identifier}"
+      raise "BEAKER_KUBEVIRT_TEST_GROUP is #{@test_group_identifier.inspect}, but namespace #{@namespace} " \
+            "already has resources labelled #{label}: " \
+            "#{found.map { |kind, names| "#{kind} #{names.join(', ')}" }.join('; ')}. " \
+            'Likely causes: a previous run kept with BEAKER_destroy=no or onpass, a parallel job or matrix ' \
+            'leg using the same value, or a second Beaker::Kubevirt instance in this process. ' \
+            "Delete them (kubectl -n #{@namespace} delete vm,dv,secret,svc -l #{label}) " \
+            'or set BEAKER_KUBEVIRT_TEST_GROUP to a value unique to this run. Nothing was created or deleted.'
+    end
+
+    ##
     # Execute a cleanup operation, logging any errors without re-raising them.
     # @param [String] description A short description for the error message
     def safe_cleanup(description)
@@ -356,7 +388,7 @@ module Beaker
       if vm_image&.start_with?('http://', 'https://')
         base_name = vm_image.split('/').last
         # Create a unique datavolume name by including the VM name in it
-        host['dv_name'] = bounded_k8s_name("#{vm_name}-#{base_name}-dv")
+        host['dv_name'] = sanitize_k8s_name("#{vm_name}-#{base_name}-dv")
       elsif vm_image && !vm_image.start_with?('docker://', 'oci://')
         # For PVC sources, we also need to clone to avoid sharing the same disk
         source_pvc = vm_image.sub(%r{^pvc://}, '')
@@ -366,7 +398,7 @@ module Beaker
         else
           source_pvc_name = source_pvc
         end
-        host['dv_name'] = bounded_k8s_name("#{vm_name}-#{source_pvc_name}")
+        host['dv_name'] = sanitize_k8s_name("#{vm_name}-#{source_pvc_name}")
 
       end
 
@@ -388,7 +420,7 @@ module Beaker
     def create_cloud_init_secret(host, cloud_init_data)
       raise 'Cloud-init data must be provided' unless cloud_init_data
 
-      secret_name = bounded_k8s_name("#{host['vm_name']}-cloud-init")
+      secret_name = sanitize_k8s_name("#{host['vm_name']}-cloud-init")
       @logger.debug("Creating cloud-init secret #{secret_name} in namespace #{@namespace}")
 
       secret_spec = {
@@ -416,25 +448,7 @@ module Beaker
     # @return [String] The generated VM name
     def generate_vm_name(host)
       host_name = host.respond_to?(:name) ? host.name : host['name']
-      bounded_k8s_name("#{@test_group_identifier}-#{host_name}")
-    end
-
-    ##
-    # Sanitize a name to a DNS label, keeping distinct inputs distinct when
-    # they exceed the 63-char cap.
-    #
-    # Plain truncation drops the tail, which is where the host name (or a
-    # suffix such as "-ssh") sits, so hosts sharing a long test-group
-    # identifier would collide. At the cap the tail is replaced with a digest
-    # of the untruncated name instead.
-    # @param [String] full_name The unsanitized name
-    # @return [String] A valid DNS label of at most 63 characters
-    def bounded_k8s_name(full_name)
-      name = sanitize_k8s_name(full_name)
-      return name if name.length < K8S_NAME_MAX
-
-      digest = Digest::SHA256.hexdigest(full_name)[0, 8]
-      "#{name[0, K8S_NAME_MAX - digest.length - 1].sub(/-+\z/, '')}-#{digest}"
+      sanitize_k8s_name("#{@test_group_identifier}-#{host_name}")
     end
 
     ##
@@ -550,7 +564,13 @@ module Beaker
     # Deleting by `beaker/test-group=<the identifier it chose>` cleans up that
     # run without touching other runs sharing the namespace.
     #
-    # @return [String, nil] the sanitized identifier, or nil when unset or blank
+    # The value is normalised once to a DNS label and used for both the
+    # beaker/test-group label and the resource names derived from it. Label
+    # values allow case, '_' and '.', names do not, so normalising them
+    # separately let `CI_1` and `ci-1` select on different labels while
+    # creating the same names.
+    #
+    # @return [String, nil] the normalised identifier, or nil when unset or blank
     def configured_test_group_identifier
       raw = ENV.fetch('BEAKER_KUBEVIRT_TEST_GROUP', '')
       return nil if raw.strip.empty?
@@ -562,11 +582,11 @@ module Beaker
                              "got #{raw.strip.length}: #{raw.inspect}"
       end
 
-      identifier = sanitize_k8s_label_value(raw)
+      identifier = sanitize_k8s_name(raw.strip.gsub(/\A[^A-Za-z0-9]+|[^A-Za-z0-9]+\z/, ''))
       if identifier != raw
         @logger.warn(
-          "BEAKER_KUBEVIRT_TEST_GROUP #{raw.inspect} is not usable as a Kubernetes " \
-          "label value; using #{identifier.inspect} instead",
+          "BEAKER_KUBEVIRT_TEST_GROUP #{raw.inspect} is not a valid DNS label (lowercase letters, " \
+          "digits and '-', starting with a letter); using #{identifier.inspect} instead",
         )
       end
       identifier
@@ -1485,7 +1505,7 @@ module Beaker
     # @param [Host] host The host
     def setup_nodeport(host)
       vm_name = host['vm_name']
-      service_name = bounded_k8s_name("#{vm_name}-ssh")
+      service_name = sanitize_k8s_name("#{vm_name}-ssh")
 
       @logger.debug("Creating NodePort service for VM #{vm_name}")
       service = @kubevirt_helper.create_nodeport_service(vm_name, service_name, @test_group_identifier)
@@ -1607,20 +1627,24 @@ module Beaker
       end
     end
 
+    ##
+    # Sanitize a name to a DNS label: lowercase, [a-z0-9-], starting with a
+    # letter and ending with a letter or digit.
+    #
+    # Plain truncation drops the tail, which is where the host name (or a
+    # suffix such as "-ssh") sits, so names sharing a long prefix would
+    # collide, and the cut can land on a '-'. Over the 63-character cap the
+    # tail is instead replaced with a digest of the unsanitized name.
+    # @param [String] name The unsanitized name
+    # @return [String] A valid DNS label of at most 63 characters
     def sanitize_k8s_name(name)
-      # Remove invalid characters, replace with hyphens
-      sanitized = name.downcase.gsub(/[^a-z0-9-]/, '-')
-
-      # Ensure it starts with a letter
+      sanitized = name.to_s.downcase.gsub(/[^a-z0-9-]/, '-')
       sanitized = "x#{sanitized}" unless /[a-z]/.match?(sanitized[0])
+      sanitized = "#{sanitized}0" if sanitized.end_with?('-')
+      return sanitized if sanitized.length <= K8S_NAME_MAX
 
-      # Ensure it doesn't end with a hyphen
-      sanitized = "#{sanitized}0" if sanitized[-1] == '-'
-
-      # Ensure it's not too long (max 63 chars for DNS label)
-      sanitized = sanitized[0..62] if sanitized.length > 63
-
-      sanitized
+      digest = Digest::SHA256.hexdigest(name.to_s)[0, 8]
+      "#{sanitized[0, K8S_NAME_MAX - digest.length - 1].sub(/-+\z/, '')}-#{digest}"
     end
 
     ##
